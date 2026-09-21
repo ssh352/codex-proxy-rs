@@ -117,6 +117,53 @@ HTTP 传输不加密，公网部署仍建议使用 HTTPS。
 客户端使用部署地址下的 `/v1`，协议与部署一致，不要使用前端开发服务的 `5173/dev/v1`。
 当前应用只支持单副本，不能通过复制容器扩容。
 
+## macOS 本地 SSH 隧道
+
+需要从 macOS 访问仅绑定在 VPS `127.0.0.1:8080` 的实例时，使用
+`deploy/macos/vps-tunnel-launchd.sh` 安装用户级 LaunchAgent。脚本只监听本机回环地址，
+不会把代理端口暴露给局域网；生成的 plist 不提交到仓库。
+
+从可信的固定 tag 或 commit 获取与部署版本匹配的脚本。当前私有 fork 的临时工作分支可按需替换
+下面的 `<ref>`，不要依赖可变的 `main`：
+
+```bash
+git clone --branch <ref> git@github.com:ssh352/codex-proxy-rs.git
+cd codex-proxy-rs
+```
+
+SSH 私钥、agent 和 `known_hosts` 必须先由当前 macOS 用户配置好。安装使用
+`BatchMode=yes` 和 `StrictHostKeyChecking=yes`，不会提示输入密码，也不会自动接受新的主机密钥。
+
+安装前提供 VPS、账号和两端端口：
+
+```bash
+export CPR_VPS_HOST='<vps-host>'
+export CPR_VPS_USER='<ssh-user>'
+export CPR_TUNNEL_LOCAL_PORT='18080'
+export CPR_TUNNEL_REMOTE_HOST='127.0.0.1'
+export CPR_TUNNEL_REMOTE_PORT='8080'
+
+deploy/macos/vps-tunnel-launchd.sh install
+```
+
+安装会检查 SSH 认证、端口占用和 `/healthz` 响应，并在以下位置创建服务与日志：
+
+- LaunchAgent：`~/Library/LaunchAgents/com.codex-proxy.vps-tunnel.plist`
+- 日志：`~/.codex-proxy/logs/vps-tunnel.{out,err}.log`
+
+维护命令从同一固定版本的脚本执行：
+
+```bash
+deploy/macos/vps-tunnel-launchd.sh status
+deploy/macos/vps-tunnel-launchd.sh restart
+deploy/macos/vps-tunnel-launchd.sh stop
+deploy/macos/vps-tunnel-launchd.sh start
+deploy/macos/vps-tunnel-launchd.sh uninstall
+```
+
+`uninstall` 只卸载该 LaunchAgent 并删除其 plist，保留日志。安装或重启失败时不要停掉其他服务；
+先查看 `status` 和 stderr 日志，再处理 SSH 密钥、主机校验或远端健康检查问题。
+
 流式响应在首个上游事件提交后，每 15 秒无输出会发送一次 SSE 注释保活，
 并设置 `X-Accel-Buffering: no` 和 `Cache-Control: no-cache, no-transform`。
 反向代理仍需允许这些响应头生效；首个事件到达前的等待也需要足够的读取超时。

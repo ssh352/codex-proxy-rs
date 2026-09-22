@@ -4557,6 +4557,116 @@ async fn opaque_provider_options_do_not_change_openai_account_selection() {
 }
 
 #[tokio::test]
+async fn http_account_scoping_drops_downstream_installation_header() {
+    for owner in ["acct_scope_same", "acct_scope_old"] {
+        let request = capture_scoped_http_request(
+            "req_installation_http",
+            "acct_scope_same",
+            owner,
+            Map::from_iter([
+                ("model".to_owned(), json!("gpt-5.4")),
+                ("input".to_owned(), json!("hello")),
+                ("installation_id".to_owned(), json!("client-installation")),
+                (
+                    "client_metadata".to_owned(),
+                    json!({"x-codex-installation-id": "client-installation"}),
+                ),
+            ]),
+            Map::from_iter([(
+                "opaque_request_headers".to_owned(),
+                json!([[
+                    "x-codex-installation-id",
+                    STANDARD.encode(b"client-installation")
+                ]]),
+            )]),
+        )
+        .await;
+        let body = captured_request_body(&request);
+        let installation_id = body["client_metadata"]["x-codex-installation-id"]
+            .as_str()
+            .expect("account installation ID");
+        assert_ne!(installation_id, "client-installation");
+        assert!(uuid::Uuid::parse_str(installation_id).is_ok());
+        assert_eq!(body["installation_id"], installation_id);
+        assert!(captured_header_values(&request, "x-codex-installation-id").is_empty());
+    }
+}
+
+#[tokio::test]
+async fn websocket_account_scoping_drops_downstream_installation_header() {
+    for owner in ["acct_scope_same", "acct_scope_old"] {
+        let store = Arc::new(MemoryAccountStore::default());
+        create_account(&store, "acct_scope_same").await;
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("listener");
+        let base_url = format!("http://{}", listener.local_addr().expect("address"));
+        let server = tokio::spawn(async move {
+            let (socket, _) = listener.accept().await.expect("accept websocket");
+            let mut installation_header = None;
+            let mut socket =
+                crate::transport::accept_codex_test_websocket_with(socket, |request, _| {
+                    installation_header = request.headers().get("x-codex-installation-id").cloned();
+                })
+                .await;
+            let message = socket.next().await.expect("request").expect("valid frame");
+            let body: Value = serde_json::from_str(message.to_text().expect("text")).expect("JSON");
+            socket
+                .send(Message::Text(
+                    json!({
+                        "type": "response.completed",
+                        "response": {"id": "resp_installation", "model": "gpt-5.4", "status": "completed", "output": []}
+                    })
+                    .to_string()
+                    .into(),
+                ))
+                .await
+                .expect("complete response");
+            (installation_header, body)
+        });
+        let payload = ProtocolPayload::json_object(
+            "openai",
+            Map::from_iter([
+                ("model".to_owned(), json!("gpt-5.4")),
+                ("input".to_owned(), json!("hello")),
+                ("installation_id".to_owned(), json!("client-installation")),
+                (
+                    "client_metadata".to_owned(),
+                    json!({"x-codex-installation-id": "client-installation"}),
+                ),
+            ]),
+        )
+        .expect("payload")
+        .with_context(Map::from_iter([(
+            "opaque_request_headers".to_owned(),
+            json!([[
+                "x-codex-installation-id",
+                STANDARD.encode(b"client-installation")
+            ]]),
+        )]));
+        let mut stream = provider_with_base_url(&store, base_url)
+            .execute(
+                planned_request(
+                    "openai",
+                    Operation::Generate(GenerateRequest::from_protocol_payload(payload)),
+                ),
+                context_with_state_owner("req_installation_ws", owner),
+            )
+            .await
+            .expect("provider stream");
+        while let Some(event) = stream.next().await {
+            event.expect("successful websocket response");
+        }
+        let (header, body) = server.await.expect("server");
+        let installation_id = body["client_metadata"]["x-codex-installation-id"]
+            .as_str()
+            .expect("account installation ID");
+        assert_ne!(installation_id, "client-installation");
+        assert!(uuid::Uuid::parse_str(installation_id).is_ok());
+        assert_eq!(body["installation_id"], installation_id);
+        assert!(header.is_none());
+    }
+}
+
+#[tokio::test]
 async fn same_account_scope_preserves_future_protocol_shapes() {
     let request = capture_scoped_http_request(
         "req_scope_same",

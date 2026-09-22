@@ -4559,6 +4559,7 @@ async fn opaque_provider_options_do_not_change_openai_account_selection() {
 #[tokio::test]
 async fn http_account_scoping_drops_downstream_installation_header() {
     for owner in ["acct_scope_same", "acct_scope_old"] {
+        let raw = r#"{"installation_id":"client-installation","future":true}"#;
         let request = capture_scoped_http_request(
             "req_installation_http",
             "acct_scope_same",
@@ -4569,16 +4570,25 @@ async fn http_account_scoping_drops_downstream_installation_header() {
                 ("installation_id".to_owned(), json!("client-installation")),
                 (
                     "client_metadata".to_owned(),
-                    json!({"x-codex-installation-id": "client-installation"}),
+                    json!({
+                        "x-codex-installation-id": "client-installation",
+                        "x-codex-turn-metadata": raw
+                    }),
                 ),
             ]),
-            Map::from_iter([(
-                "opaque_request_headers".to_owned(),
-                json!([[
-                    "x-codex-installation-id",
-                    STANDARD.encode(b"client-installation")
-                ]]),
-            )]),
+            Map::from_iter([
+                ("turn_metadata".to_owned(), json!(raw)),
+                (
+                    "opaque_request_headers".to_owned(),
+                    json!([
+                        [
+                            "x-codex-installation-id",
+                            STANDARD.encode(b"client-installation")
+                        ],
+                        ["x-codex-turn-metadata", STANDARD.encode(raw)]
+                    ]),
+                ),
+            ]),
         )
         .await;
         let body = captured_request_body(&request);
@@ -4589,22 +4599,36 @@ async fn http_account_scoping_drops_downstream_installation_header() {
         assert!(uuid::Uuid::parse_str(installation_id).is_ok());
         assert_eq!(body["installation_id"], installation_id);
         assert!(captured_header_values(&request, "x-codex-installation-id").is_empty());
+        let headers = captured_header_values(&request, "x-codex-turn-metadata");
+        assert_eq!(headers.len(), 1);
+        for encoded in [
+            std::str::from_utf8(&headers[0]).expect("header metadata"),
+            body["client_metadata"]["x-codex-turn-metadata"]
+                .as_str()
+                .expect("body metadata"),
+        ] {
+            assert_eq!(
+                serde_json::from_str::<Value>(encoded).expect("turn metadata JSON"),
+                json!({"installation_id": installation_id, "future": true}),
+            );
+        }
     }
 }
 
 #[tokio::test]
 async fn websocket_account_scoping_drops_downstream_installation_header() {
     for owner in ["acct_scope_same", "acct_scope_old"] {
+        let raw = r#"{"installation_id":"client-installation","future":true}"#;
         let store = Arc::new(MemoryAccountStore::default());
         create_account(&store, "acct_scope_same").await;
         let listener = TcpListener::bind("127.0.0.1:0").await.expect("listener");
         let base_url = format!("http://{}", listener.local_addr().expect("address"));
         let server = tokio::spawn(async move {
             let (socket, _) = listener.accept().await.expect("accept websocket");
-            let mut installation_header = None;
+            let mut received_headers = None;
             let mut socket =
                 crate::transport::accept_codex_test_websocket_with(socket, |request, _| {
-                    installation_header = request.headers().get("x-codex-installation-id").cloned();
+                    received_headers = Some(request.headers().clone());
                 })
                 .await;
             let message = socket.next().await.expect("request").expect("valid frame");
@@ -4620,7 +4644,7 @@ async fn websocket_account_scoping_drops_downstream_installation_header() {
                 ))
                 .await
                 .expect("complete response");
-            (installation_header, body)
+            (received_headers.expect("opening headers"), body)
         });
         let payload = ProtocolPayload::json_object(
             "openai",
@@ -4630,18 +4654,27 @@ async fn websocket_account_scoping_drops_downstream_installation_header() {
                 ("installation_id".to_owned(), json!("client-installation")),
                 (
                     "client_metadata".to_owned(),
-                    json!({"x-codex-installation-id": "client-installation"}),
+                    json!({
+                        "x-codex-installation-id": "client-installation",
+                        "x-codex-turn-metadata": raw
+                    }),
                 ),
             ]),
         )
         .expect("payload")
-        .with_context(Map::from_iter([(
-            "opaque_request_headers".to_owned(),
-            json!([[
-                "x-codex-installation-id",
-                STANDARD.encode(b"client-installation")
-            ]]),
-        )]));
+        .with_context(Map::from_iter([
+            ("turn_metadata".to_owned(), json!(raw)),
+            (
+                "opaque_request_headers".to_owned(),
+                json!([
+                    [
+                        "x-codex-installation-id",
+                        STANDARD.encode(b"client-installation")
+                    ],
+                    ["x-codex-turn-metadata", STANDARD.encode(raw)]
+                ]),
+            ),
+        ]));
         let mut stream = provider_with_base_url(&store, base_url)
             .execute(
                 planned_request(
@@ -4662,7 +4695,20 @@ async fn websocket_account_scoping_drops_downstream_installation_header() {
         assert_ne!(installation_id, "client-installation");
         assert!(uuid::Uuid::parse_str(installation_id).is_ok());
         assert_eq!(body["installation_id"], installation_id);
-        assert!(header.is_none());
+        assert!(!header.contains_key("x-codex-installation-id"));
+        for encoded in [
+            header["x-codex-turn-metadata"]
+                .to_str()
+                .expect("header metadata"),
+            body["client_metadata"]["x-codex-turn-metadata"]
+                .as_str()
+                .expect("body metadata"),
+        ] {
+            assert_eq!(
+                serde_json::from_str::<Value>(encoded).expect("turn metadata JSON"),
+                json!({"installation_id": installation_id, "future": true}),
+            );
+        }
     }
 }
 
@@ -5270,6 +5316,10 @@ async fn account_change_drops_only_account_bound_opaque_headers() {
                 "x-codex-turn-metadata",
                 STANDARD.encode(br#"{"installation_id":"client-installation","safe":true}"#)
             ],
+            [
+                "X-Codex-Turn-Metadata",
+                STANDARD.encode(br#"{"installationId":"second-client-installation","safe":false}"#)
+            ],
             ["x-openai-future", STANDARD.encode(b"keep-on-switch")]
         ]),
     )]);
@@ -5298,6 +5348,21 @@ async fn account_change_drops_only_account_bound_opaque_headers() {
         captured_header_values(&same_account, "x-codex-turn-state"),
         vec![b"turn-first".to_vec(), b"turn-\x80".to_vec()]
     );
+    let body = captured_request_body(&same_account);
+    let installation_id = body["client_metadata"]["x-codex-installation-id"]
+        .as_str()
+        .expect("account installation ID");
+    let metadata = captured_header_values(&same_account, "x-codex-turn-metadata");
+    assert_eq!(metadata.len(), 2);
+    for (raw, expected) in metadata.iter().zip([
+        json!({"installation_id": installation_id, "safe": true}),
+        json!({"installationId": installation_id, "safe": false}),
+    ]) {
+        assert_eq!(
+            serde_json::from_slice::<Value>(raw).expect("turn metadata JSON"),
+            expected,
+        );
+    }
     assert_eq!(
         captured_header_values(&same_account, "x-openai-future"),
         vec![b"keep-on-switch".to_vec()]

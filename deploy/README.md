@@ -155,6 +155,7 @@ deploy/macos/vps-tunnel-launchd.sh install
 
 ```bash
 deploy/macos/vps-tunnel-launchd.sh status
+deploy/macos/vps-tunnel-launchd.sh health
 just vps-tunnel-app-launchd-status
 deploy/macos/vps-tunnel-launchd.sh restart
 deploy/macos/vps-tunnel-launchd.sh stop
@@ -164,6 +165,10 @@ deploy/macos/vps-tunnel-launchd.sh uninstall
 
 `uninstall` 只卸载该 LaunchAgent 并删除其 plist，保留日志。安装或重启失败时不要停掉其他服务；
 先查看 `status` 和 stderr 日志，再处理 SSH 密钥、主机校验或远端健康检查问题。
+
+`just vps-tunnel-app-launchd-status` 在显示 LaunchAgent 状态后还会请求本机转发的 `/healthz`；
+健康检查使用已安装 plist 中保存的本地转发端口，不依赖当前终端的
+`CPR_TUNNEL_LOCAL_PORT`。命令只有在该端点返回成功的 HTTP 状态时才退出成功。
 
 流式响应在首个上游事件提交后，每 15 秒无输出会发送一次 SSE 注释保活，
 并设置 `X-Accel-Buffering: no` 和 `Cache-Control: no-cache, no-transform`。

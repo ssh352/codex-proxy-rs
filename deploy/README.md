@@ -155,6 +155,7 @@ deploy/macos/vps-tunnel-launchd.sh install
 
 ```bash
 deploy/macos/vps-tunnel-launchd.sh status
+just vps-tunnel-app-launchd-status
 deploy/macos/vps-tunnel-launchd.sh restart
 deploy/macos/vps-tunnel-launchd.sh stop
 deploy/macos/vps-tunnel-launchd.sh start

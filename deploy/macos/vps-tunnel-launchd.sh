@@ -32,6 +32,7 @@ usage() {
 Usage:
   vps-tunnel-launchd.sh install [options]
   vps-tunnel-launchd.sh status
+  vps-tunnel-launchd.sh health
   vps-tunnel-launchd.sh start
   vps-tunnel-launchd.sh restart
   vps-tunnel-launchd.sh stop
@@ -83,6 +84,11 @@ require_lifecycle_commands() {
 require_status_commands() {
     require_command launchctl
     require_command lsof
+    [[ -x /usr/libexec/PlistBuddy ]] || die "required command not found: /usr/libexec/PlistBuddy"
+}
+
+require_health_commands() {
+    require_command curl
     [[ -x /usr/libexec/PlistBuddy ]] || die "required command not found: /usr/libexec/PlistBuddy"
 }
 
@@ -227,6 +233,11 @@ resolve_install_commands() {
 resolve_status_commands() {
     LAUNCHCTL_BIN="$(command -v launchctl)"
     LSOF_BIN="$(command -v lsof)"
+    PLIST_BUDDY="/usr/libexec/PlistBuddy"
+}
+
+resolve_health_commands() {
+    CURL_BIN="$(command -v curl)"
     PLIST_BUDDY="/usr/libexec/PlistBuddy"
 }
 
@@ -433,6 +444,16 @@ local_port_from_forward_spec() {
     fi
 }
 
+configured_local_port() {
+    local spec
+    local port
+
+    spec="$(configured_forward_specs | head -n 1)"
+    [[ -n "$spec" ]] || die "could not read a local forward from $PLIST; run install first."
+    port="$(local_port_from_forward_spec "$spec")"
+    validate_port "$port" "configured local forward port"
+}
+
 show_status() {
     local output
     local state
@@ -496,6 +517,16 @@ health_check() {
     done
 
     return 1
+}
+
+health_service() {
+    local local_port
+    local health_url
+
+    local_port="$(configured_local_port)"
+    health_url="http://127.0.0.1:$local_port/healthz"
+    "$CURL_BIN" --fail --silent --show-error --output /dev/null \
+        --write-out 'health: HTTP %{http_code}\n' --max-time 10 "$health_url"
 }
 
 install_service() {
@@ -586,6 +617,13 @@ case "$command_name" in
         require_platform
         require_status_commands
         show_status
+        ;;
+    health)
+        (($# == 0)) || die "health does not accept options."
+        require_platform
+        require_health_commands
+        resolve_health_commands
+        health_service
         ;;
     start)
         (($# == 0)) || die "start does not accept options."

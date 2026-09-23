@@ -414,6 +414,15 @@ wait_for_health() {
     return 1
 }
 
+running_binary_checksum() {
+    local pid
+
+    pid="$(systemctl show -p MainPID --value "$service")"
+    [[ "$pid" =~ ^[1-9][0-9]*$ ]] || return 1
+    [[ -e "/proc/$pid/exe" ]] || return 1
+    sha256sum "/proc/$pid/exe" | cut -d ' ' -f1
+}
+
 restore_old_files() {
     local backup_dir="$1"
     local failed_dir="$backup_dir/failed-new"
@@ -551,10 +560,14 @@ if ! systemctl start "$service"; then
     start_ok=0
 fi
 if ((start_ok == 1)) && wait_for_health; then
+    running_hash="$(running_binary_checksum || true)"
+    if [[ "$running_hash" != "$expected_binary_hash" ]]; then
+        fail_after_replacement 'running process executable checksum mismatch'
+    fi
     state="$(migration_state)"
     if [[ "$state" == target ]]; then
-        printf 'upgrade=success\nrelease=%s\nmigration=%s\nhealth=204\nbinary_checksum=%s\nbackup_dir=%s\ndatabase=preserved\n' \
-            "$release_version" "$target_migration" "$remote_binary_hash" "$backup_dir"
+        printf 'upgrade=success\nrelease=%s\nmigration=%s\nhealth=204\nbinary_checksum=%s\nrunning_binary_checksum=%s\nbackup_dir=%s\ndatabase=preserved\n' \
+            "$release_version" "$target_migration" "$remote_binary_hash" "$running_hash" "$backup_dir"
         exit 0
     fi
 fi

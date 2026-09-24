@@ -15,8 +15,13 @@ PLIST="$HOME_DIR/Library/LaunchAgents/${LABEL}.plist"
 LOG_DIR="$HOME_DIR/.codex-proxy/logs"
 STDOUT_LOG="$LOG_DIR/vps-tunnel.out.log"
 STDERR_LOG="$LOG_DIR/vps-tunnel.err.log"
-DOMAIN="gui/$(id -u)"
-SERVICE="$DOMAIN/$LABEL"
+USER_ID="$(id -u)"
+GUI_DOMAIN="gui/$USER_ID"
+USER_DOMAIN="user/$USER_ID"
+DOMAIN=""
+SERVICE=""
+LOADED_DOMAIN=""
+requested_domain_choice="${CPR_TUNNEL_DOMAIN:-}"
 TEMP_PLIST=""
 
 cleanup_temp_plist() {
@@ -44,6 +49,7 @@ The install command accepts these options, or the matching environment variables
   --local-port PORT           CPR_TUNNEL_LOCAL_PORT
   --remote-host HOST          CPR_TUNNEL_REMOTE_HOST
   --remote-port PORT          CPR_TUNNEL_REMOTE_PORT
+  --domain gui|user            CPR_TUNNEL_DOMAIN
 
 Example:
   CPR_VPS_HOST=vps.example.com \
@@ -176,6 +182,15 @@ parse_install_options() {
                 remote_port="${1#*=}"
                 shift
                 ;;
+            --domain)
+                (($# >= 2)) || die "--domain requires a value."
+                requested_domain_choice="$2"
+                shift 2
+                ;;
+            --domain=*)
+                requested_domain_choice="${1#*=}"
+                shift
+                ;;
             -h|--help)
                 usage
                 exit 0
@@ -189,6 +204,10 @@ parse_install_options() {
     validate_token "$vps_host" "VPS host"
     validate_token "$vps_user" "VPS user"
     validate_token "$remote_host" "remote forward host"
+    case "$requested_domain_choice" in
+        ''|gui|user) ;;
+        *) die "domain must be gui or user." ;;
+    esac
     local_port="$(validate_port "$local_port" "local forward port")"
     remote_port="$(validate_port "$remote_port" "remote forward port")"
 
@@ -217,6 +236,7 @@ ssh_options() {
         '-o' 'ConnectTimeout=10' \
         '-o' 'StrictHostKeyChecking=yes' \
         '-o' 'ExitOnForwardFailure=yes' \
+        '-o' 'IdentityAgent=none' \
         '-o' 'ServerAliveInterval=30' \
         '-o' 'ServerAliveCountMax=3'
 }
@@ -243,16 +263,85 @@ resolve_health_commands() {
 
 resolve_lifecycle_commands() {
     LAUNCHCTL_BIN="$(command -v launchctl)"
+    PLIST_BUDDY="/usr/libexec/PlistBuddy"
+}
+
+domain_for_choice() {
+    case "$1" in
+        gui) printf '%s\n' "$GUI_DOMAIN" ;;
+        user) printf '%s\n' "$USER_DOMAIN" ;;
+        *) die "unsupported launchd domain choice: $1" ;;
+    esac
+}
+
+set_domain() {
+    DOMAIN="$1"
+    SERVICE="$DOMAIN/$LABEL"
+}
+
+plist_domain_choice() {
+    local session_type
+
+    [[ -f "$PLIST" ]] || return 1
+    [[ -x "$PLIST_BUDDY" ]] \
+        || die "required command not found: $PLIST_BUDDY"
+
+    session_type="$("$PLIST_BUDDY" -c 'Print :LimitLoadToSessionType' \
+        "$PLIST" 2>/dev/null || true)"
+    case "$session_type" in
+        Background) printf 'user\n' ;;
+        '') printf 'gui\n' ;;
+        *) die "cannot infer launchd domain from $PLIST: unsupported LimitLoadToSessionType=$session_type" ;;
+    esac
+}
+
+resolve_domain() {
+    local requested_choice="${1:-}"
+    local loaded_domain=""
+    local candidate
+    local inferred_choice
+
+    for candidate in "$GUI_DOMAIN" "$USER_DOMAIN"; do
+        if launchctl_run print "$candidate/$LABEL" >/dev/null 2>&1; then
+            if [[ -n "$loaded_domain" ]]; then
+                die "service $LABEL is loaded in both $loaded_domain and $candidate; unload one domain before continuing."
+            fi
+            loaded_domain="$candidate"
+        fi
+    done
+
+    LOADED_DOMAIN="$loaded_domain"
+    if [[ -n "$requested_choice" ]]; then
+        set_domain "$(domain_for_choice "$requested_choice")"
+    elif [[ -n "$loaded_domain" ]]; then
+        # 管理命令应继续操作实际已加载的域，不因 GUI 会话变化而自动迁移。
+        set_domain "$loaded_domain"
+    elif [[ -f "$PLIST" ]]; then
+        inferred_choice="$(plist_domain_choice)"
+        set_domain "$(domain_for_choice "$inferred_choice")"
+    else
+        # 全新安装默认使用不依赖 GUI 登录的后台 user 域。
+        set_domain "$USER_DOMAIN"
+    fi
+}
+
+launchctl_run() {
+    "$LAUNCHCTL_BIN" "$@"
 }
 
 service_output() {
-    "$LAUNCHCTL_BIN" print "$SERVICE" 2>/dev/null
+    launchctl_run print "$SERVICE" 2>/dev/null
 }
 
 service_pid() {
+    service_pid_for_domain "$DOMAIN"
+}
+
+service_pid_for_domain() {
+    local domain="$1"
     local output
 
-    output="$(service_output || true)"
+    output="$(launchctl_run print "$domain/$LABEL" 2>/dev/null || true)"
     printf '%s\n' "$output" | sed -n 's/^[[:space:]]*pid = //p' | head -n 1
 }
 
@@ -318,6 +407,12 @@ write_plist() {
             '    <integer>10</integer>' \
             '    <key>WorkingDirectory</key>'
         plist_string "$HOME_DIR"
+        if [[ "$DOMAIN" == user/* ]]; then
+            # 无 GUI 登录会话时，user 域需要明确声明后台会话类型。
+            printf '%s\n' \
+                '    <key>LimitLoadToSessionType</key>' \
+                '    <string>Background</string>'
+        fi
         printf '%s\n' \
             '    <key>ProgramArguments</key>' \
             '    <array>'
@@ -356,20 +451,27 @@ preflight_ssh() {
         || die "SSH preflight failed for $ssh_target; check the key, agent, and known_hosts entry."
 }
 
-bootout_service() {
-    if "$LAUNCHCTL_BIN" print "$SERVICE" >/dev/null 2>&1; then
-        "$LAUNCHCTL_BIN" bootout "$SERVICE" >/dev/null 2>&1 \
-            || "$LAUNCHCTL_BIN" bootout "$DOMAIN" "$PLIST" >/dev/null 2>&1 \
-            || die "could not unload $SERVICE"
+bootout_domain() {
+    local domain="$1"
+    local service="$domain/$LABEL"
+
+    if launchctl_run print "$service" >/dev/null 2>&1; then
+        launchctl_run bootout "$service" >/dev/null 2>&1 \
+            || launchctl_run bootout "$domain" "$PLIST" >/dev/null 2>&1 \
+            || die "could not unload $service"
     fi
 }
 
+bootout_service() {
+    bootout_domain "$DOMAIN"
+}
+
 bootstrap_service() {
-    "$LAUNCHCTL_BIN" bootstrap "$DOMAIN" "$PLIST"
+    launchctl_run bootstrap "$DOMAIN" "$PLIST"
 }
 
 kickstart_service() {
-    "$LAUNCHCTL_BIN" kickstart -k "$SERVICE"
+    launchctl_run kickstart -k "$SERVICE"
 }
 
 listener_summary() {
@@ -464,6 +566,7 @@ show_status() {
     local configured_ports=()
 
     resolve_status_commands
+    resolve_domain
 
     if output="$(service_output 2>&1)"; then
         state="$(printf '%s\n' "$output" | sed -n 's/^[[:space:]]*state = //p' | head -n 1)"
@@ -480,6 +583,7 @@ show_status() {
     fi
 
     printf 'plist: %s\n' "$PLIST"
+    printf 'domain: %s\n' "$DOMAIN"
     target="$(configured_target || true)"
     [[ -n "$target" ]] && printf 'target: %s\n' "$target"
     printf 'stdout: %s\n' "$STDOUT_LOG"
@@ -536,13 +640,21 @@ install_service() {
     require_install_commands
     resolve_install_commands
     parse_install_options "$@"
+    resolve_domain "$requested_domain_choice"
 
     mkdir -p "$LOG_DIR" "$HOME_DIR/Library/LaunchAgents"
-    tunnel_pid="$(service_pid)"
+    if [[ -n "$LOADED_DOMAIN" ]]; then
+        tunnel_pid="$(service_pid_for_domain "$LOADED_DOMAIN")"
+    else
+        tunnel_pid="$(service_pid)"
+    fi
     ensure_local_port_available "$local_port" "$tunnel_pid"
     preflight_ssh
     write_plist
 
+    if [[ -n "$LOADED_DOMAIN" && "$LOADED_DOMAIN" != "$DOMAIN" ]]; then
+        bootout_domain "$LOADED_DOMAIN"
+    fi
     bootout_service
     bootstrap_service
     kickstart_service
@@ -563,11 +675,12 @@ start_service() {
     require_lifecycle_commands
     resolve_lifecycle_commands
     [[ -f "$PLIST" ]] || die "plist not found: $PLIST; run install first."
+    resolve_domain
 
-    if ! "$LAUNCHCTL_BIN" print "$SERVICE" >/dev/null 2>&1; then
+    if ! launchctl_run print "$SERVICE" >/dev/null 2>&1; then
         bootstrap_service
     fi
-    "$LAUNCHCTL_BIN" kickstart "$SERVICE"
+    launchctl_run kickstart "$SERVICE"
     printf 'OK: started %s\n' "$SERVICE"
 }
 
@@ -576,6 +689,7 @@ restart_service() {
     require_lifecycle_commands
     resolve_lifecycle_commands
     [[ -f "$PLIST" ]] || die "plist not found: $PLIST; run install first."
+    resolve_domain
 
     bootout_service
     bootstrap_service
@@ -587,6 +701,7 @@ stop_service() {
     require_platform
     require_lifecycle_commands
     resolve_lifecycle_commands
+    resolve_domain
     bootout_service
     printf 'OK: stopped %s\n' "$SERVICE"
 }
@@ -595,6 +710,7 @@ uninstall_service() {
     require_platform
     require_lifecycle_commands
     resolve_lifecycle_commands
+    resolve_domain
     bootout_service
     rm -f "$PLIST"
     printf 'OK: removed %s\n' "$PLIST"

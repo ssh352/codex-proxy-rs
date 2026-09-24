@@ -131,8 +131,9 @@ git clone --branch <ref> git@github.com:ssh352/codex-proxy-rs.git
 cd codex-proxy-rs
 ```
 
-SSH 私钥、agent 和 `known_hosts` 必须先由当前 macOS 用户配置好。安装使用
-`BatchMode=yes` 和 `StrictHostKeyChecking=yes`，不会提示输入密码，也不会自动接受新的主机密钥。
+SSH 私钥和 `known_hosts` 必须先由当前 macOS 用户配置好；LaunchAgent 使用持久化的私钥文件，
+不会继承当前终端的 SSH agent。安装使用 `BatchMode=yes`、`IdentityAgent=none` 和
+`StrictHostKeyChecking=yes`，不会提示输入密码，也不会自动接受新的主机密钥。
 
 安装前提供 VPS、账号和两端端口：
 
@@ -150,6 +151,18 @@ deploy/macos/vps-tunnel-launchd.sh install
 
 - LaunchAgent：`~/Library/LaunchAgents/com.codex-proxy.vps-tunnel.plist`
 - 日志：`~/.codex-proxy/logs/vps-tunnel.{out,err}.log`
+
+全新安装默认加载到 `user/<uid>` 域，因此不要求 `zhang` 保持 GUI 登录；如果该服务已经加载，
+后续管理命令会继续使用实际域，不会因为 GUI 会话出现或消失而自动迁移。需要迁移时显式指定目标域，
+迁移会短暂中断隧道并先卸载旧域服务：
+
+```bash
+deploy/macos/vps-tunnel-launchd.sh install --domain gui
+# 或：CPR_TUNNEL_DOMAIN=user deploy/macos/vps-tunnel-launchd.sh install
+```
+
+`gui/<uid>` 适合依赖 GUI 会话的服务，退出 GUI 后隧道可能停止；`user/<uid>` 适合长期后台运行。
+如果同一 label 同时加载在两个域，脚本会报错，需先手动卸载其中一个。
 
 维护命令从同一固定版本的脚本执行：
 

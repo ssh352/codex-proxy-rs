@@ -3,14 +3,10 @@ vps-tunnel-app-launchd-status:
     bash "{{ justfile_directory() }}/deploy/macos/vps-tunnel-launchd.sh" status
     bash "{{ justfile_directory() }}/deploy/macos/vps-tunnel-launchd.sh" health
 
-# codex-proxy-rs 原生 systemd VPS 升级入口。
+# 每次显式给出 VPS 主机。默认预览并确认最新正式版；yes=true 用于无人值守。
 #
-# 保留数据库、配置、PostgreSQL 和 Redis。升级必须显式确认目标版本，并采用
-# 只向前的迁移策略；目标迁移已写入数据库后不会再启动旧二进制。
-#
-# 示例：
-#
-
-# just vps-upgrade host=179.255.105.21 version=v3.13.1
+# just vps-upgrade host=<vps-host>
+# just vps-upgrade check host=<vps-host>
+# just vps-upgrade host=<vps-host> yes=true
 vps-upgrade *args:
     bash "{{ justfile_directory() }}/deploy/native-vps-upgrade.sh" upgrade {{ args }}

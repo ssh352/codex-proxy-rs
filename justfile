@@ -8,5 +8,6 @@ vps-tunnel-app-launchd-status:
 # just vps-upgrade host=<vps-host>
 # just vps-upgrade check host=<vps-host>
 # just vps-upgrade host=<vps-host> yes=true
+# Upgrade to latest stable with confirmation; host=<vps-host> required, check previews only, yes=true skips confirmation.
 vps-upgrade *args:
     bash "{{ justfile_directory() }}/deploy/native-vps-upgrade.sh" upgrade {{ args }}

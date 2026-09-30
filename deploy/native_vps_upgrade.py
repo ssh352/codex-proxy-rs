@@ -54,6 +54,40 @@ def run(args, **kwargs):
     try:
         return subprocess.run([str(arg) for arg in args], check=True, **kwargs).stdout
     except (subprocess.SubprocessError, OSError) as error:
+        if Path(str(args[0])).name == "ssh":
+            stderr = getattr(error, "stderr", None)
+            if isinstance(stderr, bytes):
+                lines = [
+                    line.strip()
+                    for line in stderr.decode(errors="replace").splitlines()
+                ]
+                remote_error = next(
+                    (
+                        line.removeprefix("[native-vps-upgrade] ")
+                        for line in lines
+                        if line.startswith("[native-vps-upgrade] ")
+                    ),
+                    None,
+                )
+                if remote_error:
+                    raise UpgradeError(
+                        f"Remote command failed: {remote_error[:240]}"
+                    ) from error
+                transport_error = next(
+                    (
+                        line
+                        for line in lines
+                        if line.startswith("ssh:")
+                        or "Permission denied" in line
+                        or "Host key verification failed" in line
+                        or "Connection timed out" in line
+                    ),
+                    None,
+                )
+                if transport_error:
+                    raise UpgradeError(
+                        f"SSH transport failed: {transport_error[:240]}"
+                    ) from error
         raise UpgradeError(
             f"{Path(str(args[0])).name} failed; operation stopped"
         ) from error
@@ -443,25 +477,34 @@ def validate_gate(port):
 
 
 def installed_version(binary, user, target):
+    target_version = stable_version(target)
+    if target_version is None:
+        raise UpgradeError("Cannot parse target version; upgrade refused")
     try:
         output = (
             run(["runuser", "-u", user, "--", binary, "--version"], timeout=10)
             .decode()
             .strip()
         )
-    except (UpgradeError, UnicodeDecodeError) as error:
-        raise UpgradeError("Cannot read installed version; upgrade refused") from error
+    except (UpgradeError, UnicodeDecodeError):
+        return None
     installed = stable_version(output)
-    target_version = stable_version(target)
     if installed is None:
-        raise UpgradeError("Cannot parse installed version; upgrade refused")
-    if target_version is None:
-        raise UpgradeError("Cannot parse target version; upgrade refused")
+        return None
     require(
         installed <= target_version,
         "Installed version is newer than the selected release; downgrade refused",
     )
     return "v" + output.removeprefix("v")
+
+
+def validate_version_state(version, current, target):
+    if version is None:
+        # 旧版没有版本命令；仅接受数据库严格落后于目标迁移清单的情况。
+        require(
+            len(current) < len(target),
+            "Installed version is unknown and database has no pending target migrations; downgrade refused",
+        )
 
 
 def inspect_vps(config, release):
@@ -523,6 +566,7 @@ def inspect_vps(config, release):
     version = installed_version(
         config["binary"], props.get("User") or "root", release["tag"]
     )
+    validate_version_state(version, current, release["migrations"])
     database_bytes = int(psql(config, "select pg_database_size(current_database())"))
     application_bytes = sum(
         path.stat().st_size
@@ -941,7 +985,9 @@ def ssh_command(options, arguments, **kwargs):
 
 
 def preview(options, config, release, before):
-    current = before["version"]
+    current = before["version"] or (
+        "unknown (binary " + before["files"]["binary"][:12] + ")"
+    )
     print(
         f"\nHost:       {options['user']}@{options['host']}\n"
         f"Service:    {config['service']}\n"

@@ -2,6 +2,7 @@ import contextlib
 import io
 import json
 import pathlib
+import subprocess
 import tarfile
 import tempfile
 import unittest
@@ -50,7 +51,7 @@ class UpgradeContractTests(unittest.TestCase):
         self.assertEqual(release["commit"], commit)
         contract.assert_called_once_with(repository, commit)
 
-    def test_version_probe_failure_refuses_upgrade(self):
+    def test_version_probe_failure_returns_unknown_for_preview(self):
         for error in (
             upgrade.UpgradeError("unsupported --version"),
             upgrade.UpgradeError("timeout"),
@@ -59,19 +60,19 @@ class UpgradeContractTests(unittest.TestCase):
                 self.subTest(error=str(error)),
                 patch.object(upgrade, "run", side_effect=error),
             ):
-                with self.assertRaisesRegex(
-                    upgrade.UpgradeError, "Cannot read installed version"
-                ):
+                self.assertIsNone(
                     upgrade.installed_version("/app/binary", "app", "v3.13.1")
+                )
 
-    def test_unparseable_version_refuses_upgrade(self):
+    def test_unparseable_version_returns_unknown_for_preview(self):
         for output in (b"", b"unknown", b"3.14.0-rc.1", b"\xff"):
             with (
                 self.subTest(output=output),
                 patch.object(upgrade, "run", return_value=output),
             ):
-                with self.assertRaisesRegex(upgrade.UpgradeError, "upgrade refused"):
+                self.assertIsNone(
                     upgrade.installed_version("/app/binary", "app", "v3.13.1")
+                )
 
     def test_known_versions_enforce_no_downgrade(self):
         for output in (b"3.13.0\n", b"v3.13.1"):
@@ -83,6 +84,28 @@ class UpgradeContractTests(unittest.TestCase):
         with patch.object(upgrade, "run", return_value=b"3.14.0"):
             with self.assertRaisesRegex(upgrade.UpgradeError, "downgrade refused"):
                 upgrade.installed_version("/app/binary", "app", "v3.13.1")
+
+    def test_unknown_version_requires_database_to_be_behind_target(self):
+        upgrade.validate_version_state(
+            None, migrations("a", "b"), migrations("a", "b", "c")
+        )
+        with self.assertRaisesRegex(upgrade.UpgradeError, "downgrade refused"):
+            upgrade.validate_version_state(
+                None, migrations("a", "b"), migrations("a", "b")
+            )
+
+    def test_ssh_error_reports_remote_preflight_reason(self):
+        error = subprocess.CalledProcessError(
+            1,
+            ["ssh"],
+            stderr=b"[native-vps-upgrade] Cannot read installed version; upgrade refused\n",
+        )
+        with patch("subprocess.run", side_effect=error):
+            with self.assertRaisesRegex(
+                upgrade.UpgradeError,
+                "Remote command failed: Cannot read installed version; upgrade refused",
+            ):
+                upgrade.run(["ssh", "root@example", "python3 -"])
 
     def test_latest_stable_version_accepts_build_metadata_but_not_prereleases(self):
         self.assertEqual(upgrade.stable_version("v3.17.0+build.1"), (3, 17, 0))

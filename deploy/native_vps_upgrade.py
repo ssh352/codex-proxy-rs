@@ -23,6 +23,7 @@ import time
 APP = "codex-proxy-rs"
 UNIT = "codex-proxy-vps-upgrade"
 GATE = "cpr_vps_upgrade"
+PLUGIN_MANIFEST = "plugin-release-manifest.json"
 TERMINAL = {"succeeded", "restored", "failed", "blocked", "already-current"}
 STABLE_VERSION = re.compile(
     r"v?(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)"
@@ -269,6 +270,33 @@ def extract_release(archive, destination):
     return root
 
 
+def validate_release_plugins(root, release):
+    directory = root / "plugins/official"
+    expected = release["plugin_manifest_sha"]
+    if expected is None:
+        require(
+            not directory.exists(),
+            "Release has official plugins without a checksummed manifest",
+        )
+        return
+    path = directory / PLUGIN_MANIFEST
+    require(path.is_file(), "Release archive is missing the official plugin manifest")
+    require(sha(path) == expected, "Official plugin manifest checksum mismatch")
+    try:
+        manifest = json.loads(path.read_bytes())
+    except (ValueError, UnicodeDecodeError) as error:
+        raise UpgradeError("Invalid official plugin release manifest") from error
+    # 只核对发行身份；插件合同与包体仍由目标宿主在启动时校验。
+    require(
+        isinstance(manifest, dict)
+        and manifest.get("schema_version") == 1
+        and manifest.get("sealed") is True
+        and manifest.get("gateway_version") == release["tag"].removeprefix("v")
+        and manifest.get("gateway_git_sha") == release["commit"],
+        "Official plugin manifest does not belong to the selected release",
+    )
+
+
 def migration_contract(repository, commit):
     base = f"https://raw.githubusercontent.com/{repository}/{commit}/backend/migrations"
     listing = json.loads(
@@ -360,6 +388,7 @@ def resolve_release():
         "archive": asset,
         "base_url": base,
         "archive_sha": checksums[asset],
+        "plugin_manifest_sha": checksums.get(PLUGIN_MANIFEST),
         "migrations": migration_contract(repository, commit),
     }
 
@@ -434,6 +463,7 @@ def file_paths(config, config_path):
     return {
         "binary": Path(config["binary"]),
         "web": Path(config["web"]),
+        "official_plugins": Path(config["binary"]).parent / "plugins/official",
         "config": Path(config_path),
     }
 
@@ -551,6 +581,10 @@ def inspect_vps(config, release):
         "Cannot locate the running service's deploy/config.yaml",
     )
     paths = file_paths(config, config_path)
+    require(
+        not paths["official_plugins"].parent.is_symlink(),
+        "Official plugins parent cannot be a symlink",
+    )
     files = {name: fingerprint(path) for name, path in paths.items()}
     require(files["binary"] and files["web"], "Application files are missing")
     require(
@@ -731,7 +765,13 @@ class Deployment:
         sources = {
             "binary": root / APP,
             "web": root / "web/dist",
+            "official_plugins": root / "plugins/official",
         }
+        plugins_parent = self.paths["official_plugins"].parent
+        if sources["official_plugins"].exists() and not plugins_parent.exists():
+            plugins_parent.mkdir(mode=0o755)
+            # worker 使用 0077 umask；首次安装时仍需允许服务用户遍历发行目录。
+            plugins_parent.chmod(0o755)
         for name, source in sources.items():
             self.replace(source, self.paths[name])
 
@@ -913,9 +953,11 @@ def worker(plan_path):
                 "Release archive checksum mismatch",
             )
             root = extract_release(archive, stage / "release")
+            validate_release_plugins(root, plan["release"])
             plan["release"]["files"] = {
                 "binary": fingerprint(root / APP),
                 "web": fingerprint(root / "web/dist"),
+                "official_plugins": fingerprint(root / "plugins/official"),
             }
             write_json(plan_file, plan)
             if all(

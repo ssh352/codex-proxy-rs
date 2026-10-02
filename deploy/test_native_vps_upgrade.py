@@ -1,6 +1,8 @@
 import contextlib
 import io
+import itertools
 import json
+import os
 import pathlib
 import subprocess
 import tarfile
@@ -48,8 +50,31 @@ class UpgradeContractTests(unittest.TestCase):
         ):
             release = upgrade.resolve_release()
         self.assertEqual(release["archive_sha"], checksum)
+        self.assertIsNone(release["plugin_manifest_sha"])
         self.assertEqual(release["commit"], commit)
         contract.assert_called_once_with(repository, commit)
+
+    def test_release_metadata_records_the_published_plugin_manifest_checksum(self):
+        checksum = "b" * 64
+
+        def download(url):
+            if url.endswith("releases/latest"):
+                return json.dumps(
+                    {"tag_name": "v3.18.3", "draft": False, "prerelease": False}
+                ).encode()
+            if url.endswith("checksums.txt"):
+                return (
+                    f"{'a' * 64}  codex-proxy-rs_3.18.3_linux_amd64.tar.gz\n"
+                    f"{checksum}  plugin-release-manifest.json\n"
+                ).encode()
+            return json.dumps({"sha": "c" * 40}).encode()
+
+        with (
+            patch.object(upgrade, "download", side_effect=download),
+            patch.object(upgrade, "migration_contract", return_value=migrations("a")),
+        ):
+            release = upgrade.resolve_release()
+        self.assertEqual(release["plugin_manifest_sha"], checksum)
 
     def test_version_probe_failure_returns_unknown_for_preview(self):
         for error in (
@@ -155,6 +180,20 @@ class UpgradeContractTests(unittest.TestCase):
                 ("codex-proxy-rs/web", tarfile.DIRTYPE, 0o755, b""),
                 ("codex-proxy-rs/web/dist", tarfile.DIRTYPE, 0o755, b""),
                 ("codex-proxy-rs/deploy", tarfile.DIRTYPE, 0o755, b""),
+                ("codex-proxy-rs/plugins", tarfile.DIRTYPE, 0o755, b""),
+                ("codex-proxy-rs/plugins/official", tarfile.DIRTYPE, 0o555, b""),
+                (
+                    "codex-proxy-rs/plugins/official/plugin-release-manifest.json",
+                    tarfile.REGTYPE,
+                    0o444,
+                    b"manifest",
+                ),
+                (
+                    "codex-proxy-rs/plugins/official/example.tar.gz",
+                    tarfile.REGTYPE,
+                    0o444,
+                    b"plugin",
+                ),
                 (
                     "codex-proxy-rs/deploy/config.example.yaml",
                     tarfile.REGTYPE,
@@ -178,6 +217,313 @@ class UpgradeContractTests(unittest.TestCase):
                 (extracted / "codex-proxy-rs").stat().st_mode & 0o777, 0o755
             )
             self.assertEqual((extracted / "web/dist/index.html").read_bytes(), b"ok")
+            official = extracted / "plugins/official"
+            self.assertEqual(
+                (official / upgrade.PLUGIN_MANIFEST).read_bytes(), b"manifest"
+            )
+            self.assertEqual((official / "example.tar.gz").read_bytes(), b"plugin")
+            self.assertEqual(official.stat().st_mode & 0o777, 0o555)
+            self.assertEqual(
+                (official / upgrade.PLUGIN_MANIFEST).stat().st_mode & 0o777, 0o444
+            )
+
+
+class PluginReleaseTests(unittest.TestCase):
+    def test_manifest_is_bound_to_the_target_version_and_commit(self):
+        release = {"tag": "v3.18.3", "commit": "a" * 40}
+        manifest = {
+            "schema_version": 1,
+            "sealed": True,
+            "gateway_version": "3.18.3",
+            "gateway_git_sha": release["commit"],
+            "plugins": [],
+        }
+        with tempfile.TemporaryDirectory() as temp:
+            root = pathlib.Path(temp)
+            path = root / "plugins/official" / upgrade.PLUGIN_MANIFEST
+            path.parent.mkdir(parents=True)
+            for change in (
+                {},
+                {"gateway_version": "3.18.2"},
+                {"gateway_git_sha": "b" * 40},
+                {"sealed": False},
+                {"schema_version": 2},
+            ):
+                with self.subTest(change=change):
+                    path.write_text(json.dumps(manifest | change))
+                    target = release | {"plugin_manifest_sha": upgrade.sha(path)}
+                    if change:
+                        with self.assertRaisesRegex(
+                            upgrade.UpgradeError, "selected release"
+                        ):
+                            upgrade.validate_release_plugins(root, target)
+                    else:
+                        upgrade.validate_release_plugins(root, target)
+
+    def test_missing_corrupt_or_unchecksummed_manifest_is_rejected(self):
+        release = {
+            "tag": "v3.18.3",
+            "commit": "a" * 40,
+            "plugin_manifest_sha": "b" * 64,
+        }
+        with tempfile.TemporaryDirectory() as temp:
+            root = pathlib.Path(temp)
+            with self.assertRaisesRegex(upgrade.UpgradeError, "missing"):
+                upgrade.validate_release_plugins(root, release)
+            path = root / "plugins/official" / upgrade.PLUGIN_MANIFEST
+            path.parent.mkdir(parents=True)
+            path.write_bytes(b"not json")
+            with self.assertRaisesRegex(upgrade.UpgradeError, "checksum mismatch"):
+                upgrade.validate_release_plugins(root, release)
+            with self.assertRaisesRegex(upgrade.UpgradeError, "Invalid official"):
+                upgrade.validate_release_plugins(
+                    root, release | {"plugin_manifest_sha": upgrade.sha(path)}
+                )
+            with self.assertRaisesRegex(upgrade.UpgradeError, "without a checksummed"):
+                upgrade.validate_release_plugins(
+                    root, release | {"plugin_manifest_sha": None}
+                )
+
+    def test_legacy_release_without_plugins_remains_supported(self):
+        with tempfile.TemporaryDirectory() as temp:
+            upgrade.validate_release_plugins(
+                pathlib.Path(temp), {"plugin_manifest_sha": None}
+            )
+
+
+class DeploymentFilesTests(unittest.TestCase):
+    def create_deployment(self, stage, *, legacy=False, release_plugins=True):
+        installed = stage / "installed"
+        installed.mkdir()
+        binary = installed / upgrade.APP
+        binary.write_bytes(b"old binary")
+        web = installed / "web/dist"
+        web.mkdir(parents=True)
+        (web / "index.html").write_bytes(b"old web")
+        config_path = installed / "config.yaml"
+        config_path.write_bytes(b"existing config")
+        config = {
+            "binary": str(binary),
+            "web": str(web),
+            "backups": str(stage / "backups"),
+            "database": "test",
+            "service": "test.service",
+            "port": 8080,
+        }
+        paths = upgrade.file_paths(config, config_path)
+        if not legacy:
+            paths["official_plugins"].mkdir(parents=True)
+            (paths["official_plugins"] / upgrade.PLUGIN_MANIFEST).write_bytes(
+                b"old manifest"
+            )
+            (paths["official_plugins"] / "example.tar.gz").write_bytes(
+                b"old plugin archive"
+            )
+        before = {
+            "files": {key: upgrade.fingerprint(path) for key, path in paths.items()},
+            "migrations": migrations("old"),
+            "config_path": str(config_path),
+        }
+        root = stage / "release" / upgrade.APP
+        (root / "web/dist").mkdir(parents=True)
+        (root / upgrade.APP).write_bytes(b"new binary")
+        (root / "web/dist/index.html").write_bytes(b"new web")
+        official = root / "plugins/official"
+        if release_plugins:
+            official.mkdir(parents=True)
+            (official / upgrade.PLUGIN_MANIFEST).write_bytes(b"new manifest")
+            (official / "example.tar.gz").write_bytes(b"new plugin archive")
+        release = {
+            "tag": "v3.18.3",
+            "files": {
+                "binary": upgrade.fingerprint(root / upgrade.APP),
+                "web": upgrade.fingerprint(root / "web/dist"),
+                "official_plugins": upgrade.fingerprint(official),
+            },
+            "migrations": migrations("old", "new"),
+        }
+        return upgrade.Deployment(
+            {"config": config, "before": before, "release": release}, stage
+        )
+
+    def mock_commands(self):
+        real_run = upgrade.run
+
+        def run(args, **kwargs):
+            if args[0] == "cp":
+                return real_run(args, **kwargs)
+            if "pg_dump" in args:
+                kwargs["stdout"].write(b"database backup")
+            return b""
+
+        return patch.object(upgrade, "run", side_effect=run)
+
+    def test_install_verify_and_restore_include_official_plugins(self):
+        for legacy in (False, True):
+            with self.subTest(legacy=legacy), tempfile.TemporaryDirectory() as temp:
+                stage = pathlib.Path(temp)
+                deployment = self.create_deployment(stage, legacy=legacy)
+                paths = deployment.paths
+                before = deployment.before
+                release = deployment.release
+                deployment.backups.mkdir()
+
+                with (
+                    self.mock_commands(),
+                    patch.object(
+                        upgrade, "migrations", return_value=before["migrations"]
+                    ),
+                    patch.object(upgrade, "psql", return_value=""),
+                ):
+                    deployment.backup()
+                    previous_umask = os.umask(0o077)
+                    try:
+                        deployment.install()
+                    finally:
+                        os.umask(previous_umask)
+                    self.assertEqual(
+                        paths["official_plugins"].parent.stat().st_mode & 0o777,
+                        0o755,
+                    )
+                    self.assertEqual(
+                        upgrade.fingerprint(paths["official_plugins"]),
+                        release["files"]["official_plugins"],
+                    )
+                    expected = release["files"] | {"config": before["files"]["config"]}
+                    real_sha = upgrade.sha
+
+                    def sha(path):
+                        if str(path).startswith("/proc/"):
+                            return real_sha(paths["binary"])
+                        return real_sha(path)
+
+                    with (
+                        patch.object(
+                            upgrade,
+                            "health",
+                            side_effect=lambda config, mark=0, path="/healthz": bool(
+                                mark
+                            ),
+                        ),
+                        patch.object(
+                            upgrade, "properties", return_value={"MainPID": "123"}
+                        ),
+                        patch.object(upgrade, "gate_present", return_value=True),
+                        patch.object(upgrade, "sha", side_effect=sha),
+                    ):
+                        deployment.verify(expected, before["migrations"])
+                        (
+                            paths["official_plugins"] / upgrade.PLUGIN_MANIFEST
+                        ).write_bytes(b"mismatched manifest")
+                        with self.assertRaisesRegex(
+                            upgrade.UpgradeError, "Installed files"
+                        ):
+                            deployment.verify(expected, before["migrations"])
+                    deployment.restore()
+                self.assertEqual(
+                    {key: upgrade.fingerprint(path) for key, path in paths.items()},
+                    before["files"],
+                )
+
+    def execute_deployment(self, deployment, *, failed_activation=False):
+        gated = False
+        before = deployment.before
+        release = deployment.release
+        paths = deployment.paths
+        real_sha = upgrade.sha
+        expected = (
+            before["files"]
+            if failed_activation
+            else release["files"] | {"config": before["files"]["config"]}
+        )
+
+        def gate_on():
+            nonlocal gated
+            gated = True
+
+        def gate_off():
+            nonlocal gated
+            self.assertEqual(
+                {key: upgrade.fingerprint(path) for key, path in paths.items()},
+                expected,
+            )
+            gated = False
+
+        def health(config, mark=0, path="/healthz"):
+            if (
+                failed_activation
+                and upgrade.fingerprint(paths["binary"]) == release["files"]["binary"]
+            ):
+                return False
+            return bool(mark) or not gated
+
+        def current_migrations(config):
+            return (
+                release["migrations"]
+                if upgrade.fingerprint(paths["binary"]) == release["files"]["binary"]
+                else before["migrations"]
+            )
+
+        def sha(path):
+            if str(path).startswith("/proc/"):
+                return real_sha(paths["binary"])
+            return real_sha(path)
+
+        # 用虚拟时钟触发启动超时，文件备份、安装、校验与恢复仍执行实际实现。
+        with (
+            self.mock_commands(),
+            patch.object(upgrade, "psql", return_value=""),
+            patch.object(upgrade, "inspect_vps", return_value=before),
+            patch.object(upgrade, "migrations", side_effect=current_migrations),
+            patch.object(upgrade, "health", side_effect=health),
+            patch.object(upgrade, "properties", return_value={"MainPID": "123"}),
+            patch.object(upgrade, "gate_present", side_effect=lambda: gated),
+            patch.object(upgrade, "sha", side_effect=sha),
+            patch.object(deployment, "gate_on", side_effect=gate_on),
+            patch.object(deployment, "gate_off", side_effect=gate_off) as reopen,
+            patch.object(deployment, "stop"),
+            patch.object(deployment, "start"),
+            patch.object(upgrade.time, "monotonic", side_effect=itertools.count(0, 61)),
+            patch.object(upgrade.time, "sleep"),
+        ):
+            deployment.execute()
+            reopen.assert_called_once_with()
+        self.assertFalse(gated)
+
+    def test_successful_plugin_free_upgrade_removes_plugins_and_retains_backup(self):
+        with tempfile.TemporaryDirectory() as temp:
+            deployment = self.create_deployment(
+                pathlib.Path(temp), release_plugins=False
+            )
+            self.execute_deployment(deployment)
+            self.assertFalse(deployment.paths["official_plugins"].exists())
+            self.assertEqual(
+                upgrade.fingerprint(deployment.backups / "previous/official_plugins"),
+                deployment.before["files"]["official_plugins"],
+            )
+            status = json.loads((deployment.stage / "status.json").read_text())
+            self.assertEqual(status["phase"], "succeeded")
+
+    def test_failed_activation_restores_plugins_before_reopening_traffic(self):
+        for release_plugins in (False, True):
+            with (
+                self.subTest(release_plugins=release_plugins),
+                tempfile.TemporaryDirectory() as temp,
+            ):
+                deployment = self.create_deployment(
+                    pathlib.Path(temp), release_plugins=release_plugins
+                )
+                self.execute_deployment(deployment, failed_activation=True)
+                self.assertEqual(
+                    {
+                        key: upgrade.fingerprint(path)
+                        for key, path in deployment.paths.items()
+                    },
+                    deployment.before["files"],
+                )
+                status = json.loads((deployment.stage / "status.json").read_text())
+                self.assertEqual(status["phase"], "restored")
+                self.assertIn("Service failed startup", status["reason"])
 
 
 class FakeDeployment(upgrade.Deployment):

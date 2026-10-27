@@ -217,7 +217,18 @@ def download(url, destination=None):
     ]
     if destination:
         args.extend(["--output", str(destination)])
-    return run(args, timeout=1000)
+    try:
+        return run(args, timeout=1000)
+    except UpgradeError as error:
+        cause = error.__cause__
+        # 仅报告退出码，不透传可能包含代理凭据的 curl 原始错误
+        if isinstance(cause, subprocess.CalledProcessError):
+            detail = f"curl exit {cause.returncode}"
+        elif isinstance(cause, subprocess.TimeoutExpired):
+            detail = "download timed out"
+        else:
+            detail = "could not execute curl"
+        raise UpgradeError(f"Download failed: {url} ({detail})") from error
 
 
 def extract_release(archive, destination):

@@ -21,6 +21,24 @@ def migrations(*checksums, failed=()):
 
 
 class UpgradeContractTests(unittest.TestCase):
+    def test_download_failure_reports_location_and_exit_code_without_raw_stderr(self):
+        url = "https://api.github.com/repos/example/gateway/releases/latest"
+        for code in (22, 6):
+            with (
+                self.subTest(code=code),
+                patch(
+                    "subprocess.run",
+                    side_effect=subprocess.CalledProcessError(
+                        code, ["curl"], stderr=b"secret"
+                    ),
+                ),
+            ):
+                with self.assertRaises(upgrade.UpgradeError) as caught:
+                    upgrade.download(url)
+                self.assertIn(url, str(caught.exception))
+                self.assertIn(f"curl exit {code}", str(caught.exception))
+                self.assertNotIn("secret", str(caught.exception))
+
     def test_release_metadata_accepts_published_assets_without_plugins(self):
         repository = "example/gateway"
         tag = "v3.13.1"
